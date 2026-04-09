@@ -824,7 +824,7 @@ export default function App() {
           )}
         </header>
 
-        <main className="flex flex-1 flex-col pb-4">
+        <main className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-[calc(env(safe-area-inset-bottom)+6rem)]">
           <AnimatePresence mode="wait">
             
             {/* Lobby / Join Screen */}
@@ -1379,11 +1379,35 @@ export default function App() {
         </div>
       )}
 
+      {isJoined && gameState?.status === 'UPLOADING' && photoReview && !me?.photosUploaded && (
+        <div className="fixed inset-x-0 bottom-0 z-40 border-t border-white/10 bg-zinc-950/80 px-4 py-3 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] backdrop-blur-xl">
+          <div className="mx-auto flex w-full max-w-md">
+            <button
+              type="button"
+              onClick={confirmPhotoReview}
+              disabled={isUploading}
+              className="pressable-btn flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-fuchsia-500 via-pink-500 to-orange-400 py-4 font-black text-white shadow-xl shadow-fuchsia-900/30 transition-all hover:scale-[1.01] hover:from-fuchsia-400 hover:to-orange-300 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:scale-100"
+            >
+              {isUploading ? (
+                <>
+                  <Loader2 className="h-5 w-5 animate-spin" />
+                  Sending... {uploadProgress}%
+                </>
+              ) : (
+                'Zatwierdź i Graj'
+              )}
+            </button>
+          </div>
+        </div>
+      )}
+
       {isJoined && (
         <>
           <button
             onClick={() => setChatOpen((current) => !current)}
-            className="fixed bottom-4 right-4 z-50 flex h-14 w-14 items-center justify-center rounded-full border border-white/10 bg-gradient-to-br from-fuchsia-500 via-pink-500 to-orange-400 text-white shadow-2xl shadow-fuchsia-900/30 backdrop-blur-md transition-transform hover:scale-105"
+            className={`fixed right-4 z-50 flex h-14 w-14 items-center justify-center rounded-full border border-white/10 bg-gradient-to-br from-fuchsia-500 via-pink-500 to-orange-400 text-white shadow-2xl shadow-fuchsia-900/30 backdrop-blur-md transition-transform hover:scale-105 ${
+              gameState?.status === 'UPLOADING' && photoReview && !me?.photosUploaded ? 'bottom-[7.5rem]' : 'bottom-4'
+            }`}
             aria-label="Toggle chat"
           >
             <MessageCircle className="h-6 w-6" />
