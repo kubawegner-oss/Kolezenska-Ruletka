@@ -15,11 +15,20 @@ const sharedClientToken = (() => {
 
 const sharedSocket = (() => {
   if (typeof window === 'undefined') return null;
+
+  const configuredSocketUrl = (import.meta.env.VITE_SOCKET_URL as string | undefined)?.trim();
+  const socketUrl = configuredSocketUrl
+    ? configuredSocketUrl
+    : import.meta.env.DEV && window.location.port !== '3000'
+      ? `${window.location.protocol}//${window.location.hostname}:3000`
+      : undefined;
+
   const w = window as Window & { __photoRouletteSocket?: Socket };
   if (!w.__photoRouletteSocket) {
-    w.__photoRouletteSocket = io({
+    w.__photoRouletteSocket = io(socketUrl, {
       transports: ['websocket', 'polling'],
       reconnectionAttempts: 5,
+      timeout: 10000,
     });
   }
   return w.__photoRouletteSocket;
@@ -95,6 +104,36 @@ function displayName(value: unknown): string {
   return 'Player';
 }
 
+function sampleRandomItems<T>(items: T[], count: number): T[] {
+  const shuffled = [...items];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled.slice(0, count);
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let currentIndex = 0;
+
+  const runWorker = async () => {
+    while (currentIndex < items.length) {
+      const index = currentIndex;
+      currentIndex += 1;
+      results[index] = await worker(items[index], index);
+    }
+  };
+
+  const workers = Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, () => runWorker());
+  await Promise.all(workers);
+  return results;
+}
+
 export default function App() {
   const [socket, setSocket] = useState<Socket | null>(null);
   const [gameState, setGameState] = useState<GameState | null>(null);
@@ -109,8 +148,12 @@ export default function App() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [floatingReactions, setFloatingReactions] = useState<ReactionEvent[]>([]);
   const [celebrationPopups, setCelebrationPopups] = useState<CelebrationPopup[]>([]);
+  const [animatedScores, setAnimatedScores] = useState<Record<string, number>>({});
   const lastCelebrationKeyRef = useRef<string>('');
   const celebrationTimeoutRef = useRef<number | null>(null);
+  const scoreAnimationRef = useRef<number | null>(null);
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
+  const lastReactionSentAtRef = useRef(0);
 
   useEffect(() => {
     const savedMessages = window.localStorage.getItem('photo-roulette-chat');
@@ -128,6 +171,13 @@ export default function App() {
   }, [chatMessages]);
 
   useEffect(() => {
+    if (!chatOpen) return;
+    const panel = chatScrollRef.current;
+    if (!panel) return;
+    panel.scrollTop = panel.scrollHeight;
+  }, [chatMessages, chatOpen]);
+
+  useEffect(() => {
     const newSocket = sharedSocket;
     if (!newSocket) return;
 
@@ -135,6 +185,7 @@ export default function App() {
 
     newSocket.on('connect', () => {
       console.log('Socket connected:', newSocket.id);
+      newSocket.emit('requestState');
     });
 
     newSocket.on('connect_error', (err) => {
@@ -174,6 +225,10 @@ export default function App() {
       alert(msg);
     });
 
+    if (newSocket.connected) {
+      newSocket.emit('requestState');
+    }
+
     return () => {
       newSocket.off('connect');
       newSocket.off('connect_error');
@@ -182,19 +237,35 @@ export default function App() {
       newSocket.off('chatHistory');
       newSocket.off('photoReaction');
       newSocket.off('error');
+      newSocket.off('requestState');
     };
   }, []);
 
   useEffect(() => {
     if (gameState?.status === 'PLAYING' && gameState.roundStartTime) {
-      const interval = setInterval(() => {
+      const updateTimeLeft = () => {
         const elapsed = Date.now() - gameState.roundStartTime;
         const remaining = Math.max(0, Math.ceil((gameState.roundDuration - elapsed) / 1000));
-        setTimeLeft(remaining);
-      }, 250);
+        setTimeLeft((current) => (current === remaining ? current : remaining));
+      };
+
+      updateTimeLeft();
+      const interval = setInterval(() => {
+        updateTimeLeft();
+      }, 1000);
       return () => clearInterval(interval);
     }
   }, [gameState?.status, gameState?.roundStartTime, gameState?.roundDuration]);
+
+  useEffect(() => {
+    if (!isUploading || !gameState) return;
+
+    const myPlayer = socket?.id ? gameState.players[socket.id] : null;
+    if (gameState.status !== 'UPLOADING' || myPlayer?.photosUploaded) {
+      setIsUploading(false);
+      setUploadProgress(0);
+    }
+  }, [gameState, isUploading, socket?.id]);
 
   useEffect(() => {
     const currentPhoto = gameState?.currentPhoto;
@@ -259,8 +330,55 @@ export default function App() {
       if (celebrationTimeoutRef.current) {
         window.clearTimeout(celebrationTimeoutRef.current);
       }
+      if (scoreAnimationRef.current) {
+        window.cancelAnimationFrame(scoreAnimationRef.current);
+      }
     };
   }, []);
+
+  useEffect(() => {
+    const scoreEntries = Object.entries(gameState?.players ?? {}) as Array<[string, Player]>;
+    if (scoreEntries.length === 0) {
+      setAnimatedScores({});
+      return;
+    }
+
+    const targetScores = Object.fromEntries(scoreEntries.map(([id, player]) => [id, player.score]));
+
+    if (Object.keys(animatedScores).length === 0) {
+      setAnimatedScores(targetScores);
+      return;
+    }
+
+    const startScores = { ...animatedScores };
+    const duration = 650;
+    const start = performance.now();
+
+    if (scoreAnimationRef.current) {
+      window.cancelAnimationFrame(scoreAnimationRef.current);
+    }
+
+    const tick = (timestamp: number) => {
+      const progress = Math.min(1, (timestamp - start) / duration);
+      const eased = 1 - Math.pow(1 - progress, 3);
+      const nextScores: Record<string, number> = {};
+
+      for (const [id, target] of Object.entries(targetScores)) {
+        const from = startScores[id] ?? 0;
+        nextScores[id] = Math.round(from + (target - from) * eased);
+      }
+
+      setAnimatedScores(nextScores);
+
+      if (progress < 1) {
+        scoreAnimationRef.current = window.requestAnimationFrame(tick);
+      } else {
+        scoreAnimationRef.current = null;
+      }
+    };
+
+    scoreAnimationRef.current = window.requestAnimationFrame(tick);
+  }, [gameState?.players]);
 
   const joinGame = () => {
     if (name.trim() && socket) {
@@ -282,7 +400,15 @@ export default function App() {
   };
 
   const sendReaction = (emoji: string) => {
-    socket?.emit('photoReaction', emoji);
+    if (!socket) return;
+
+    const now = Date.now();
+    if (now - lastReactionSentAtRef.current < 250) {
+      return;
+    }
+
+    lastReactionSentAtRef.current = now;
+    socket.emit('photoReaction', emoji);
   };
 
   const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -296,22 +422,23 @@ export default function App() {
     setUploadProgress(0);
 
     try {
-      const selectedFiles: File[] = files.sort(() => Math.random() - 0.5).slice(0, 10);
-      const processedPhotos: string[] = [];
-
-      for (let i = 0; i < selectedFiles.length; i++) {
-        const file = selectedFiles[i];
+      const selectedFiles = sampleRandomItems(files, 10);
+      let completed = 0;
+      const processedPhotos = await mapWithConcurrency(selectedFiles, 3, async (file) => {
         const resized = await resizeAndCompressImage(file);
-        processedPhotos.push(resized);
-        setUploadProgress(Math.round(((i + 1) / selectedFiles.length) * 100));
-      }
+        completed += 1;
+        setUploadProgress(Math.round((completed / selectedFiles.length) * 95));
+        return resized;
+      });
 
+      setUploadProgress(100);
       socket?.emit('uploadPhotos', processedPhotos);
     } catch (error) {
       console.error('Photo processing failed:', error);
       alert('Unable to process photos. Please try again.');
-    } finally {
       setIsUploading(false);
+      setUploadProgress(0);
+    } finally {
       e.target.value = '';
     }
   };
@@ -326,22 +453,10 @@ export default function App() {
         reject(new Error('Failed to load image'));
       };
       img.onload = async () => {
-        const MAX_WIDTH = 800;
-        const MAX_HEIGHT = 800;
-        let width = img.width;
-        let height = img.height;
-
-        if (width > height) {
-          if (width > MAX_WIDTH) {
-            height *= MAX_WIDTH / width;
-            width = MAX_WIDTH;
-          }
-        } else {
-          if (height > MAX_HEIGHT) {
-            width *= MAX_HEIGHT / height;
-            height = MAX_HEIGHT;
-          }
-        }
+        const MAX_DIMENSION = 1024;
+        const scale = Math.min(1, MAX_DIMENSION / Math.max(img.width, img.height));
+        const width = Math.max(1, Math.round(img.width * scale));
+        const height = Math.max(1, Math.round(img.height * scale));
 
         const canvas = document.createElement('canvas');
         canvas.width = width;
@@ -358,7 +473,9 @@ export default function App() {
         context.fillRect(0, 0, width, height);
         context.drawImage(img, 0, 0, width, height);
 
-        const base64 = canvas.toDataURL('image/jpeg', 0.7);
+        const base64 = canvas.toDataURL('image/jpeg', 0.6);
+        canvas.width = 0;
+        canvas.height = 0;
         URL.revokeObjectURL(objectUrl);
         resolve(base64);
       };
@@ -386,6 +503,9 @@ export default function App() {
 
   const myId = socket?.id;
   const players: Player[] = Object.values(gameState.players);
+  const sortedPlayers = [...players].sort((a, b) => b.score - a.score);
+  const maxScore = Math.max(...players.map((p) => p.score), 1);
+  const myGuessSubmitted = !!gameState.guesses[myId || ''];
   const me = myId ? gameState.players[myId] : null;
   const isHost = !!me?.isHost || gameState.hostId === myId;
 
@@ -566,25 +686,18 @@ export default function App() {
                         disabled={isUploading}
                       />
                       {isUploading ? (
-                        <div className="flex flex-col items-center gap-4">
-                          <div className="relative w-20 h-20 flex items-center justify-center">
-                            <svg className="w-full h-full -rotate-90">
-                              <circle
-                                cx="40" cy="40" r="36"
-                                fill="none" stroke="currentColor" strokeWidth="4"
-                                className="text-white/10"
-                              />
-                              <circle
-                                cx="40" cy="40" r="36"
-                                fill="none" stroke="currentColor" strokeWidth="4"
-                                strokeDasharray={226}
-                                strokeDashoffset={226 - (226 * uploadProgress) / 100}
-                                className="text-fuchsia-400 transition-all duration-300"
-                              />
-                            </svg>
-                            <span className="absolute text-sm font-bold">{uploadProgress}%</span>
+                        <div className="flex w-full max-w-[220px] flex-col items-center gap-4 px-4">
+                          <div className="flex items-center gap-2 text-fuchsia-200">
+                            <Loader2 className="h-5 w-5 animate-spin" />
+                            <p className="text-sm font-semibold">Uploading &amp; Processing...</p>
                           </div>
-                          <p className="text-sm font-medium text-zinc-300">Processing...</p>
+                          <div className="h-2 w-full overflow-hidden rounded-full bg-white/15">
+                            <div
+                              className="h-full rounded-full bg-gradient-to-r from-fuchsia-500 via-pink-400 to-cyan-300 transition-[width] duration-300"
+                              style={{ width: `${uploadProgress}%` }}
+                            />
+                          </div>
+                          <span className="text-xs font-bold tracking-wide text-zinc-300">{uploadProgress}%</span>
                         </div>
                       ) : (
                         <>
@@ -703,16 +816,43 @@ export default function App() {
                     <button
                       key={p.id}
                       onClick={() => submitGuess(p.id)}
-                      disabled={!!gameState.guesses[myId || '']}
+                      disabled={myGuessSubmitted}
                       className={`min-h-14 rounded-2xl border px-4 py-4 text-sm font-bold transition-all ${
                         gameState.guesses[myId || ''] === p.id
                           ? 'bg-gradient-to-r from-fuchsia-500 to-orange-400 border-fuchsia-300 text-white shadow-lg shadow-fuchsia-900/20'
                           : 'bg-white/6 border-white/10 hover:border-fuchsia-300/40 text-zinc-200'
                       } disabled:opacity-50`}
                     >
-                      {displayName(p.name)}
+                      <span className="inline-flex items-center gap-2">
+                        {displayName(p.name)}
+                        {!gameState.guesses[p.id] ? (
+                          <span className="h-2 w-2 rounded-full bg-amber-300 animate-pulse" aria-label="Waiting for vote" />
+                        ) : (
+                          <CheckCircle2 className="h-3.5 w-3.5 text-emerald-300" />
+                        )}
+                      </span>
                     </button>
                   ))}
+                </div>
+
+                <div className="grid gap-2 rounded-2xl border border-white/10 bg-white/5 p-3">
+                  <p className="text-[11px] font-black uppercase tracking-widest text-zinc-400">Who is still voting?</p>
+                  <div className="flex flex-wrap gap-2">
+                    {players.map((player) => {
+                      const waiting = !gameState.guesses[player.id];
+                      return (
+                        <span
+                          key={player.id}
+                          className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold ${
+                            waiting ? 'bg-amber-300/15 text-amber-200' : 'bg-emerald-300/15 text-emerald-200'
+                          }`}
+                        >
+                          <span className={`h-2 w-2 rounded-full ${waiting ? 'bg-amber-300 animate-pulse' : 'bg-emerald-300'}`} />
+                          {displayName(player.name)}
+                        </span>
+                      );
+                    })}
+                  </div>
                 </div>
               </motion.div>
             )}
@@ -747,11 +887,19 @@ export default function App() {
                     Leaderboard
                   </h3>
                   <div className="grid gap-2">
-                    {players.sort((a, b) => b.score - a.score).map((p, idx) => {
+                    {sortedPlayers.map((p, idx) => {
                       const isCorrect = gameState.guesses[p.id] === gameState.currentPhoto?.ownerId;
+                      const scorePercent = Math.max(6, Math.round((p.score / maxScore) * 100));
                       return (
-                        <div key={p.id} className="flex items-center justify-between rounded-2xl border border-white/10 bg-white/6 p-4 shadow-lg shadow-black/10 backdrop-blur-sm">
-                          <div className="flex items-center gap-3">
+                        <div key={p.id} className="relative overflow-hidden rounded-2xl border border-white/10 bg-white/6 p-4 shadow-lg shadow-black/10 backdrop-blur-sm">
+                          <motion.div
+                            initial={{ width: 0 }}
+                            animate={{ width: `${scorePercent}%` }}
+                            transition={{ duration: 0.6, ease: 'easeOut' }}
+                            className="pointer-events-none absolute inset-y-0 left-0 rounded-2xl bg-gradient-to-r from-fuchsia-500/25 to-cyan-400/20"
+                          />
+                          <div className="relative z-10 flex items-center justify-between">
+                            <div className="flex items-center gap-3">
                             <span className="text-zinc-500 font-mono w-4">{idx + 1}.</span>
                             <span className="font-bold">{displayName(p.name)}</span>
                             {isCorrect ? (
@@ -760,7 +908,8 @@ export default function App() {
                               <XCircle className="w-4 h-4 text-red-500/50" />
                             )}
                           </div>
-                          <span className="font-mono font-bold text-fuchsia-300">{p.score}</span>
+                            <span className="font-mono font-bold text-fuchsia-300">{animatedScores[p.id] ?? p.score}</span>
+                          </div>
                         </div>
                       );
                     })}
@@ -784,13 +933,13 @@ export default function App() {
                 </div>
 
                 <div className="w-full space-y-3">
-                  {players.sort((a, b) => b.score - a.score).map((p, idx) => (
+                  {sortedPlayers.map((p, idx) => (
                     <div key={p.id} className={`flex items-center justify-between rounded-3xl border p-4 sm:p-5 ${idx === 0 ? 'border-fuchsia-300/40 bg-gradient-to-r from-fuchsia-500/20 via-pink-500/15 to-orange-400/20' : 'border-white/10 bg-white/6'}`}>
                       <div className="flex items-center gap-4">
                         <span className={`text-2xl font-black ${idx === 0 ? 'text-amber-300' : 'text-zinc-400'}`}>{idx + 1}</span>
                         <span className="text-lg font-bold sm:text-xl">{displayName(p.name)}</span>
                       </div>
-                      <span className="text-2xl font-mono font-black text-fuchsia-300">{p.score}</span>
+                      <span className="text-2xl font-mono font-black text-fuchsia-300">{animatedScores[p.id] ?? p.score}</span>
                     </div>
                   ))}
                 </div>
@@ -861,7 +1010,7 @@ export default function App() {
               </button>
             </div>
 
-            <div className="flex-1 space-y-3 overflow-y-auto px-4 py-4">
+            <div ref={chatScrollRef} className="flex-1 space-y-3 overflow-y-auto px-4 py-4">
               {chatMessages.length === 0 ? (
                 <p className="text-sm text-zinc-500">No messages yet.</p>
               ) : (

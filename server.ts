@@ -1,6 +1,6 @@
 import express from 'express';
 import { createServer } from 'http';
-import { Server } from 'socket.io';
+import { Server, Socket } from 'socket.io';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -48,6 +48,22 @@ interface GameState {
   chatHistory: ChatMessage[];
 }
 
+interface PublicPlayer {
+  id: string;
+  name: string;
+  score: number;
+  photosUploaded: boolean;
+  ready: boolean;
+  isHost: boolean;
+}
+
+interface PublicGameState extends Omit<GameState, 'players' | 'photos'> {
+  players: Record<string, PublicPlayer>;
+  photos: [];
+  uploadedPhotos: number;
+  expectedPhotos: number;
+}
+
 let gameState: GameState = {
   status: 'LOBBY',
   players: {},
@@ -90,6 +106,12 @@ async function startServer() {
   const httpServer = createServer(app);
   const io = new Server(httpServer, {
     maxHttpBufferSize: 50 * 1024 * 1024, // 50MB limit for photo uploads
+    cors: process.env.NODE_ENV !== 'production'
+      ? {
+          origin: true,
+          credentials: true,
+        }
+      : undefined,
   });
 
   function sanitizeState() {
@@ -107,6 +129,60 @@ async function startServer() {
       senderName: normalizeText(msg.senderName),
       message: normalizeText(msg.message, ''),
     }));
+  }
+
+  function toPublicState(): PublicGameState {
+    const players = Object.fromEntries(
+      Object.values(gameState.players).map((player) => [
+        player.id,
+        {
+          id: player.id,
+          name: normalizeText(player.name),
+          score: player.score,
+          photosUploaded: player.photosUploaded,
+          ready: player.ready,
+          isHost: player.isHost,
+        } satisfies PublicPlayer,
+      ]),
+    );
+
+    const currentPhoto = gameState.currentPhoto
+      ? {
+          ownerId: gameState.currentPhoto.ownerId,
+          ownerName: normalizeText(gameState.currentPhoto.ownerName),
+          data: gameState.currentPhoto.data,
+        }
+      : null;
+
+    return {
+      status: gameState.status,
+      players,
+      photos: [],
+      currentRound: gameState.currentRound,
+      totalRounds: gameState.totalRounds,
+      currentPhoto,
+      roundStartTime: gameState.roundStartTime,
+      roundDuration: gameState.roundDuration,
+      guesses: gameState.guesses,
+      guessTimes: gameState.guessTimes,
+      hostId: gameState.hostId,
+      hostToken: null,
+      chatHistory: [],
+      uploadedPhotos: gameState.photos.length,
+      expectedPhotos: Object.keys(gameState.players).length * 10,
+    };
+  }
+
+  function emitGameState(target?: Socket) {
+    sanitizeState();
+    const payload = toPublicState();
+
+    if (target) {
+      target.emit('gameState', payload);
+      return;
+    }
+
+    io.emit('gameState', payload);
   }
 
   function syncHost() {
@@ -151,9 +227,13 @@ async function startServer() {
     console.log('User connected:', socket.id);
     
     // Send initial state to the new client
-    sanitizeState();
-    socket.emit('gameState', gameState);
+    emitGameState(socket);
     socket.emit('chatHistory', gameState.chatHistory);
+
+    socket.on('requestState', () => {
+      emitGameState(socket);
+      socket.emit('chatHistory', gameState.chatHistory);
+    });
 
     socket.on('join', (payload: { name: string; clientToken?: string } | string) => {
       const parsedName = typeof payload === 'string' ? payload : payload?.name;
@@ -195,8 +275,7 @@ async function startServer() {
 
       syncHost();
 
-      sanitizeState();
-      io.emit('gameState', gameState);
+      emitGameState();
     });
 
     socket.on('startGame', (requestedRounds: number) => {
@@ -211,7 +290,7 @@ async function startServer() {
       if (gameState.status === 'LOBBY' && Object.keys(gameState.players).length >= 2) {
         gameState.totalRounds = Math.max(1, rounds);
         gameState.status = 'UPLOADING';
-        io.emit('gameState', gameState);
+        emitGameState();
       }
     });
 
@@ -238,7 +317,7 @@ async function startServer() {
       const player = gameState.players[socket.id];
       if (!player || gameState.status !== 'PLAYING') return;
 
-      io.emit('photoReaction', {
+      io.volatile.emit('photoReaction', {
         id: `${socket.id}-${Date.now()}`,
         senderName: player.name,
         emoji,
@@ -264,7 +343,7 @@ async function startServer() {
       if (allUploaded) {
         startPlaying();
       } else {
-        io.emit('gameState', gameState);
+        emitGameState();
       }
     });
 
@@ -300,7 +379,7 @@ async function startServer() {
       if (totalGuesses === totalPlayers) {
         endRound();
       } else {
-        io.emit('gameState', gameState);
+        emitGameState();
       }
     });
 
@@ -329,7 +408,7 @@ async function startServer() {
 
       if (gameState.status !== 'LOBBY' && remainingPlayers < 2) {
         resetGame();
-        io.emit('gameState', gameState);
+        emitGameState();
         return;
       }
 
@@ -344,7 +423,7 @@ async function startServer() {
       if (currentOwnerDisconnected && gameState.status === 'PLAYING') {
         endRound();
       } else {
-        io.emit('gameState', gameState);
+        emitGameState();
       }
     });
   });
@@ -365,8 +444,11 @@ async function startServer() {
     gameState.status = 'PLAYING';
     gameState.currentRound = 0;
     gameState.totalRounds = Math.min(Math.max(1, gameState.totalRounds || gameState.photos.length), gameState.photos.length, 20); // Limit to selected rounds
-    // Shuffle photos
-    gameState.photos = gameState.photos.sort(() => Math.random() - 0.5);
+    // Shuffle photos (Fisher-Yates)
+    for (let i = gameState.photos.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [gameState.photos[i], gameState.photos[j]] = [gameState.photos[j], gameState.photos[i]];
+    }
     nextRound();
   }
 
@@ -374,7 +456,12 @@ async function startServer() {
     if (gameState.currentRound >= gameState.totalRounds) {
       clearRoundTimers();
       gameState.status = 'GAME_OVER';
-      io.emit('gameState', gameState);
+      gameState.currentPhoto = null;
+      gameState.guesses = {};
+      gameState.guessTimes = {};
+      gameState.roundStartTime = 0;
+      gameState.photos = [];
+      emitGameState();
       return;
     }
 
@@ -385,7 +472,7 @@ async function startServer() {
     gameState.roundStartTime = Date.now();
     gameState.currentRound++;
 
-    io.emit('gameState', gameState);
+    emitGameState();
 
     // Auto-end round after duration
     const roundNumber = gameState.currentRound;
@@ -401,7 +488,7 @@ async function startServer() {
     clearRoundTimers();
     gameState.status = 'ROUND_RESULTS';
 
-    io.emit('gameState', gameState);
+    emitGameState();
 
     // Wait 5 seconds before next round
     resultsTimeout = setTimeout(() => {
