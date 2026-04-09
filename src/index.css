@@ -43,6 +43,19 @@
 }
 
 @layer components {
+	.ui-stage {
+		transition: opacity 220ms ease, transform 220ms ease;
+		will-change: opacity, transform;
+	}
+
+	.pressable-btn {
+		transition: transform 120ms ease, filter 160ms ease, opacity 160ms ease;
+	}
+
+	.pressable-btn:active {
+		transform: scale(0.97);
+	}
+
 	.vote-grid {
 		display: grid;
 		grid-template-columns: repeat(2, minmax(0, 1fr));

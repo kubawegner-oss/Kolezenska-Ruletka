@@ -64,6 +64,11 @@ interface PublicGameState extends Omit<GameState, 'players' | 'photos'> {
   expectedPhotos: number;
 }
 
+interface AckResponse {
+  ok: boolean;
+  message?: string;
+}
+
 let gameState: GameState = {
   status: 'LOBBY',
   players: {},
@@ -235,7 +240,7 @@ async function startServer() {
       socket.emit('chatHistory', gameState.chatHistory);
     });
 
-    socket.on('join', (payload: { name: string; clientToken?: string } | string) => {
+    socket.on('join', (payload: { name: string; clientToken?: string } | string, ack?: (response: AckResponse) => void) => {
       const parsedName = typeof payload === 'string' ? payload : payload?.name;
       const parsedToken = typeof payload === 'string' ? socket.id : payload?.clientToken;
       const name = normalizeText(parsedName, '').trim();
@@ -243,15 +248,18 @@ async function startServer() {
 
       if (!name || !clientToken) {
         socket.emit('error', 'Invalid join data');
+        ack?.({ ok: false, message: 'Invalid join data' });
         return;
       }
 
       if (Object.keys(gameState.players).length >= 10) {
         socket.emit('error', 'Room is full');
+        ack?.({ ok: false, message: 'Room is full' });
         return;
       }
       if (gameState.status !== 'LOBBY') {
         socket.emit('error', 'Game already in progress');
+        ack?.({ ok: false, message: 'Game already in progress' });
         return;
       }
 
@@ -276,14 +284,16 @@ async function startServer() {
       syncHost();
 
       emitGameState();
+      ack?.({ ok: true });
     });
 
-    socket.on('startGame', (requestedRounds: number) => {
+    socket.on('startGame', (requestedRounds: number, ack?: (response: AckResponse) => void) => {
       const host = gameState.players[socket.id];
       const rounds = Number.isFinite(requestedRounds) ? Math.floor(requestedRounds) : 10;
 
       if (!host?.isHost) {
         socket.emit('error', 'Only the host can start the game');
+        ack?.({ ok: false, message: 'Only the host can start the game' });
         return;
       }
 
@@ -291,7 +301,11 @@ async function startServer() {
         gameState.totalRounds = Math.max(1, rounds);
         gameState.status = 'UPLOADING';
         emitGameState();
+        ack?.({ ok: true });
+        return;
       }
+
+      ack?.({ ok: false, message: 'Need at least 2 players in lobby to start' });
     });
 
     socket.on('chatMessage', (message: string) => {
@@ -313,9 +327,12 @@ async function startServer() {
       io.emit('chatMessage', chatMessage);
     });
 
-    socket.on('photoReaction', (emoji: string) => {
+    socket.on('photoReaction', (emoji: string, ack?: (response: AckResponse) => void) => {
       const player = gameState.players[socket.id];
-      if (!player || gameState.status !== 'PLAYING') return;
+      if (!player || gameState.status !== 'PLAYING') {
+        ack?.({ ok: false, message: 'Reactions are available only during a round' });
+        return;
+      }
 
       io.volatile.emit('photoReaction', {
         id: `${socket.id}-${Date.now()}`,
@@ -323,11 +340,21 @@ async function startServer() {
         emoji,
         timestamp: Date.now(),
       });
+
+      ack?.({ ok: true });
     });
 
-    socket.on('uploadPhotos', (photos: string[]) => {
+    socket.on('uploadPhotos', (photos: string[], ack?: (response: AckResponse) => void) => {
       const player = gameState.players[socket.id];
-      if (!player || gameState.status !== 'UPLOADING') return;
+      if (!player || gameState.status !== 'UPLOADING') {
+        ack?.({ ok: false, message: 'Uploads are not accepted right now' });
+        return;
+      }
+
+      if (!Array.isArray(photos) || photos.length === 0) {
+        ack?.({ ok: false, message: 'No photos to upload' });
+        return;
+      }
 
       const newPhotos = photos.map(data => ({
         ownerId: socket.id,
@@ -345,11 +372,19 @@ async function startServer() {
       } else {
         emitGameState();
       }
+
+      ack?.({ ok: true });
     });
 
-    socket.on('submitGuess', (guessedPlayerId: string) => {
-      if (gameState.status !== 'PLAYING') return;
-      if (gameState.guesses[socket.id]) return; // Already guessed
+    socket.on('submitGuess', (guessedPlayerId: string, ack?: (response: AckResponse) => void) => {
+      if (gameState.status !== 'PLAYING') {
+        ack?.({ ok: false, message: 'Round is not active' });
+        return;
+      }
+      if (gameState.guesses[socket.id]) {
+        ack?.({ ok: false, message: 'Guess already submitted' });
+        return;
+      }
 
       const submittedAt = Date.now();
       gameState.guesses[socket.id] = guessedPlayerId;
@@ -381,6 +416,8 @@ async function startServer() {
       } else {
         emitGameState();
       }
+
+      ack?.({ ok: true });
     });
 
     socket.on('disconnect', () => {

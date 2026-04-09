@@ -95,6 +95,11 @@ interface PhotoReviewState {
   pool: ReviewPhotoItem[];
 }
 
+interface AckResponse {
+  ok: boolean;
+  message?: string;
+}
+
 const celebrationPhrases = ['WOW', 'SZTOS', 'YASSS', '<3', 'OMG', 'LETS GO', 'ICONIC', 'MEGA'];
 const celebrationTones = [
   'from-fuchsia-400 via-pink-400 to-orange-300 text-white shadow-fuchsia-500/30',
@@ -183,12 +188,28 @@ export default function App() {
   const [celebrationPopups, setCelebrationPopups] = useState<CelebrationPopup[]>([]);
   const [animatedScores, setAnimatedScores] = useState<Record<string, number>>({});
   const [photoReview, setPhotoReview] = useState<PhotoReviewState | null>(null);
+  const [joinStatus, setJoinStatus] = useState<'idle' | 'clicked' | 'sending'>('idle');
+  const [startStatus, setStartStatus] = useState<'idle' | 'clicked' | 'sending'>('idle');
+  const [joinLocked, setJoinLocked] = useState(false);
+  const [startLocked, setStartLocked] = useState(false);
+  const [optimisticGuessId, setOptimisticGuessId] = useState<string | null>(null);
+  const [isGuessSending, setIsGuessSending] = useState(false);
+  const [lastReactionClicked, setLastReactionClicked] = useState<string | null>(null);
+  const [isReactionSending, setIsReactionSending] = useState(false);
+  const [processingOverlay, setProcessingOverlay] = useState<{ active: boolean; progress: number; status: string }>({
+    active: false,
+    progress: 0,
+    status: '',
+  });
+  const [isPreparingSelection, setIsPreparingSelection] = useState(false);
   const lastCelebrationKeyRef = useRef<string>('');
   const celebrationTimeoutRef = useRef<number | null>(null);
   const scoreAnimationRef = useRef<number | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const lastReactionSentAtRef = useRef(0);
   const photoReviewRef = useRef<PhotoReviewState | null>(null);
+  const joinDebounceRef = useRef(0);
+  const startDebounceRef = useRef(0);
 
   useEffect(() => {
     const savedMessages = window.localStorage.getItem('photo-roulette-chat');
@@ -313,6 +334,36 @@ export default function App() {
   }, [gameState, isUploading, socket?.id]);
 
   useEffect(() => {
+    if (isJoined) {
+      setJoinStatus('idle');
+      setJoinLocked(false);
+    }
+  }, [isJoined]);
+
+  useEffect(() => {
+    if (gameState?.status === 'UPLOADING') {
+      setStartStatus('idle');
+      setStartLocked(false);
+    }
+  }, [gameState?.status]);
+
+  useEffect(() => {
+    const localId = socket?.id;
+    if (!localId) return;
+
+    if (gameState?.status !== 'PLAYING') {
+      setOptimisticGuessId(null);
+      setIsGuessSending(false);
+      return;
+    }
+
+    if (optimisticGuessId && gameState?.guesses[localId] && gameState.guesses[localId] !== optimisticGuessId) {
+      setOptimisticGuessId(gameState.guesses[localId]);
+      setIsGuessSending(false);
+    }
+  }, [gameState?.guesses, gameState?.status, optimisticGuessId, socket?.id]);
+
+  useEffect(() => {
     const currentPhoto = gameState?.currentPhoto;
     const celebrationKey = gameState?.status && currentPhoto
       ? `${gameState.status}-${gameState.currentRound}-${currentPhoto.ownerId}`
@@ -426,15 +477,70 @@ export default function App() {
     scoreAnimationRef.current = window.requestAnimationFrame(tick);
   }, [gameState?.players]);
 
-  const joinGame = () => {
-    if (name.trim() && socket) {
-      socket.emit('join', { name: name.trim(), clientToken: sharedClientToken });
-      setIsJoined(true);
+  const deferToUI = () => new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+
+  const emitWithAck = <T,>(eventName: string, payload: T): Promise<AckResponse> => {
+    return new Promise((resolve) => {
+      if (!socket) {
+        resolve({ ok: false, message: 'No server connection' });
+        return;
+      }
+
+      socket.timeout(12000).emit(eventName, payload, (err: Error | null, response?: AckResponse) => {
+        if (err) {
+          resolve({ ok: false, message: 'Server acknowledgement timed out' });
+          return;
+        }
+
+        resolve(response ?? { ok: true });
+      });
+    });
+  };
+
+  const joinGame = async () => {
+    const trimmedName = name.trim();
+    if (!trimmedName || !socket || joinLocked) return;
+
+    const now = Date.now();
+    if (now - joinDebounceRef.current < 700) return;
+    joinDebounceRef.current = now;
+
+    setJoinLocked(true);
+    setJoinStatus('clicked');
+    setIsJoined(true);
+
+    await deferToUI();
+    setJoinStatus('sending');
+
+    const response = await emitWithAck('join', { name: trimmedName, clientToken: sharedClientToken });
+
+    if (!response.ok) {
+      setIsJoined(false);
+      setJoinStatus('idle');
+      setJoinLocked(false);
+      alert(response.message ?? 'Failed to join room');
     }
   };
 
-  const startGame = () => {
-    socket?.emit('startGame', roundCount);
+  const startGame = async () => {
+    if (!socket || startLocked || players.length < 2) return;
+
+    const now = Date.now();
+    if (now - startDebounceRef.current < 700) return;
+    startDebounceRef.current = now;
+
+    setStartLocked(true);
+    setStartStatus('clicked');
+
+    await deferToUI();
+    setStartStatus('sending');
+
+    const response = await emitWithAck('startGame', roundCount);
+    if (!response.ok) {
+      setStartStatus('idle');
+      setStartLocked(false);
+      alert(response.message ?? 'Unable to start game');
+    }
   };
 
   const sendChatMessage = () => {
@@ -445,7 +551,7 @@ export default function App() {
     setChatText('');
   };
 
-  const sendReaction = (emoji: string) => {
+  const sendReaction = async (emoji: string) => {
     if (!socket) return;
 
     const now = Date.now();
@@ -454,7 +560,20 @@ export default function App() {
     }
 
     lastReactionSentAtRef.current = now;
-    socket.emit('photoReaction', emoji);
+    setLastReactionClicked(emoji);
+    setIsReactionSending(true);
+
+    await deferToUI();
+    const response = await emitWithAck('photoReaction', emoji);
+    setIsReactionSending(false);
+
+    window.setTimeout(() => {
+      setLastReactionClicked((current) => (current === emoji ? null : current));
+    }, 220);
+
+    if (!response.ok) {
+      alert(response.message ?? 'Reaction was not sent');
+    }
   };
 
   const openPhotoReview = (files: File[]) => {
@@ -465,16 +584,21 @@ export default function App() {
 
     releaseReviewSelection(photoReviewRef.current);
 
-    const pickedFiles = sampleRandomItems(files, 10);
-    const pickedSet = new Set(pickedFiles);
-    const poolFiles = files.filter((file) => !pickedSet.has(file));
-
+    setIsPreparingSelection(true);
     setUploadProgress(0);
     setIsUploading(false);
-    setPhotoReview({
-      selected: pickedFiles.map(createReviewPhotoItem),
-      pool: sampleRandomItems(poolFiles, poolFiles.length).map(createReviewPhotoItem),
-    });
+
+    window.setTimeout(() => {
+      const pickedFiles = sampleRandomItems(files, 10);
+      const pickedSet = new Set(pickedFiles);
+      const poolFiles = files.filter((file) => !pickedSet.has(file));
+
+      setPhotoReview({
+        selected: pickedFiles.map(createReviewPhotoItem),
+        pool: sampleRandomItems(poolFiles, poolFiles.length).map(createReviewPhotoItem),
+      });
+      setIsPreparingSelection(false);
+    }, 0);
   };
 
   const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -530,24 +654,41 @@ export default function App() {
 
     setIsUploading(true);
     setUploadProgress(0);
+    setProcessingOverlay({ active: true, progress: 0, status: 'Processing Images...' });
 
     try {
+      await deferToUI();
       const selectedFiles: File[] = photoReview.selected.map((item) => item.file);
       let completed = 0;
       const processedPhotos = await mapWithConcurrency(selectedFiles, 3, async (file) => {
+        await deferToUI();
         const resized = await resizeAndCompressImage(file);
         completed += 1;
-        setUploadProgress(Math.round((completed / selectedFiles.length) * 95));
+        const progress = Math.round((completed / selectedFiles.length) * 92);
+        setUploadProgress(progress);
+        setProcessingOverlay({ active: true, progress, status: 'Processing Images...' });
         return resized;
       });
 
+      setUploadProgress(96);
+      setProcessingOverlay({ active: true, progress: 96, status: 'Sending...' });
+
+      const response = await emitWithAck('uploadPhotos', processedPhotos);
+      if (!response.ok) {
+        throw new Error(response.message ?? 'Upload failed');
+      }
+
       setUploadProgress(100);
-      socket.emit('uploadPhotos', processedPhotos);
+      setProcessingOverlay({ active: true, progress: 100, status: 'Uploaded. Waiting for players...' });
+      window.setTimeout(() => {
+        setProcessingOverlay({ active: false, progress: 0, status: '' });
+      }, 350);
     } catch (error) {
       console.error('Photo processing failed:', error);
       alert('Unable to process photos. Please try again.');
       setIsUploading(false);
       setUploadProgress(0);
+      setProcessingOverlay({ active: false, progress: 0, status: '' });
     }
   };
 
@@ -590,8 +731,23 @@ export default function App() {
     });
   };
 
-  const submitGuess = (playerId: string) => {
-    socket?.emit('submitGuess', playerId);
+  const submitGuess = async (playerId: string) => {
+    if (!socket || isGuessSending || myGuessSubmitted || optimisticGuessId) return;
+
+    setOptimisticGuessId(playerId);
+    setIsGuessSending(true);
+
+    await deferToUI();
+    const response = await emitWithAck('submitGuess', playerId);
+
+    if (!response.ok) {
+      setOptimisticGuessId(null);
+      setIsGuessSending(false);
+      alert(response.message ?? 'Guess was not submitted');
+      return;
+    }
+
+    setIsGuessSending(false);
   };
 
   if (!gameState) {
@@ -613,7 +769,7 @@ export default function App() {
   const players: Player[] = Object.values(gameState.players);
   const sortedPlayers = [...players].sort((a, b) => b.score - a.score);
   const maxScore = Math.max(...players.map((p) => p.score), 1);
-  const myGuessSubmitted = !!gameState.guesses[myId || ''];
+  const myGuessSubmitted = !!gameState.guesses[myId || ''] || !!optimisticGuessId;
   const me = myId ? gameState.players[myId] : null;
   const isHost = !!me?.isHost || gameState.hostId === myId;
   const reviewSelectedCount = photoReview?.selected.length ?? 0;
@@ -678,7 +834,7 @@ export default function App() {
                 initial={{ opacity: 0, y: 20 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, scale: 0.95 }}
-                className="flex flex-col gap-6 pt-8 sm:pt-12"
+                className="ui-stage flex flex-col gap-6 pt-8 sm:pt-12"
               >
                 <div className="space-y-2">
                   <h2 className="text-3xl font-black sm:text-4xl bg-gradient-to-r from-fuchsia-300 via-pink-200 to-cyan-200 bg-clip-text text-transparent">Welcome!</h2>
@@ -695,10 +851,17 @@ export default function App() {
                   />
                   <button
                     onClick={joinGame}
-                    disabled={!name.trim()}
-                    className="flex w-full items-center justify-center gap-2 rounded-3xl bg-gradient-to-r from-fuchsia-500 via-pink-500 to-orange-400 py-4 font-black text-white shadow-xl shadow-fuchsia-900/30 transition-all hover:scale-[1.01] hover:from-fuchsia-400 hover:to-orange-300 disabled:opacity-50 disabled:hover:scale-100"
+                    disabled={!name.trim() || joinLocked}
+                    className={`pressable-btn flex w-full items-center justify-center gap-2 rounded-3xl bg-gradient-to-r from-fuchsia-500 via-pink-500 to-orange-400 py-4 font-black text-white shadow-xl shadow-fuchsia-900/30 transition-all hover:scale-[1.01] hover:from-fuchsia-400 hover:to-orange-300 disabled:opacity-50 disabled:hover:scale-100 ${joinStatus === 'clicked' ? 'scale-[0.99]' : ''}`}
                   >
-                    Join Room
+                    {joinStatus === 'sending' ? (
+                      <>
+                        <Loader2 className="h-5 w-5 animate-spin" />
+                        Sending...
+                      </>
+                    ) : (
+                      'Join Room'
+                    )}
                   </button>
                 </div>
               </motion.div>
@@ -711,7 +874,7 @@ export default function App() {
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
                 exit={{ opacity: 0 }}
-                className="flex flex-col gap-6"
+                className="ui-stage flex flex-col gap-6"
               >
                 <div className="space-y-4">
                   <h2 className="text-3xl font-black sm:text-4xl bg-gradient-to-r from-cyan-200 via-fuchsia-200 to-orange-200 bg-clip-text text-transparent">Waiting for players...</h2>
@@ -756,11 +919,20 @@ export default function App() {
                 {isHost && (
                   <button
                     onClick={startGame}
-                    disabled={players.length < 2}
-                    className="flex w-full items-center justify-center gap-2 rounded-3xl bg-gradient-to-r from-fuchsia-500 via-pink-500 to-orange-400 py-4 font-black text-white shadow-xl shadow-fuchsia-900/30 transition-all hover:scale-[1.01] hover:from-fuchsia-400 hover:to-orange-300 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:scale-100"
+                    disabled={players.length < 2 || startLocked}
+                    className={`pressable-btn flex w-full items-center justify-center gap-2 rounded-3xl bg-gradient-to-r from-fuchsia-500 via-pink-500 to-orange-400 py-4 font-black text-white shadow-xl shadow-fuchsia-900/30 transition-all hover:scale-[1.01] hover:from-fuchsia-400 hover:to-orange-300 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:scale-100 ${startStatus === 'clicked' ? 'scale-[0.99]' : ''}`}
                   >
-                    <Play className="w-5 h-5 fill-current" />
-                    Start Game
+                    {startStatus === 'sending' ? (
+                      <>
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                        Sending...
+                      </>
+                    ) : (
+                      <>
+                        <Play className="w-5 h-5 fill-current" />
+                        Start Game
+                      </>
+                    )}
                   </button>
                 )}
                 {!isHost && players.length >= 2 && (
@@ -778,7 +950,7 @@ export default function App() {
                 key="uploading"
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
-                className="mt-8 flex flex-col items-center gap-8 text-center"
+                className="ui-stage mt-8 flex flex-col items-center gap-8 text-center"
               >
                 {!me?.photosUploaded ? (
                   <>
@@ -787,7 +959,12 @@ export default function App() {
                       <p className="text-sm text-zinc-300 sm:text-base">Select a batch of photos. We'll randomly pick 10 for the game.</p>
                     </div>
 
-                    {!photoReview ? (
+                    {isPreparingSelection ? (
+                      <div className="w-full max-w-[min(280px,80vw)] rounded-[2rem] border border-white/10 bg-white/8 px-6 py-10 text-center">
+                        <Loader2 className="mx-auto h-8 w-8 animate-spin text-fuchsia-300" />
+                        <p className="mt-3 text-sm font-semibold text-zinc-200">Preparing random photo set...</p>
+                      </div>
+                    ) : !photoReview ? (
                       <label className="group flex w-full aspect-square max-w-[min(280px,80vw)] cursor-pointer flex-col items-center justify-center gap-4 rounded-[2rem] border-2 border-dashed border-fuchsia-300/30 bg-gradient-to-br from-white/8 via-fuchsia-500/10 to-cyan-500/10 transition-all hover:scale-[1.01] hover:border-fuchsia-300/60">
                         <input
                           type="file"
@@ -941,7 +1118,7 @@ export default function App() {
                 key="playing"
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
-                className="flex flex-col gap-5"
+                className="ui-stage flex flex-col gap-5"
               >
                 <div className="flex items-center justify-between gap-3">
                   <span className="text-xs font-black uppercase tracking-widest text-cyan-200/90 sm:text-sm">Round {gameState.currentRound}/{gameState.totalRounds}</span>
@@ -991,11 +1168,15 @@ export default function App() {
                       ))}
                     </AnimatePresence>
                   </div>
-                  {gameState.guesses[myId || ''] && (
+                  {(gameState.guesses[myId || ''] || optimisticGuessId) && (
                     <div className="absolute inset-0 flex items-center justify-center bg-black/60 backdrop-blur-sm">
                       <div className="text-center space-y-2">
-                        <CheckCircle2 className="w-12 h-12 text-green-500 mx-auto" />
-                        <p className="font-bold text-xl">Guess Submitted!</p>
+                        {isGuessSending ? (
+                          <Loader2 className="w-12 h-12 animate-spin text-fuchsia-300 mx-auto" />
+                        ) : (
+                          <CheckCircle2 className="w-12 h-12 text-green-500 mx-auto" />
+                        )}
+                        <p className="font-bold text-xl">{isGuessSending ? 'Sending...' : 'Guess Submitted!'}</p>
                         <p className="text-zinc-400 text-sm">Waiting for others...</p>
                       </div>
                     </div>
@@ -1006,10 +1187,13 @@ export default function App() {
                         <button
                           key={emoji}
                           onClick={() => sendReaction(emoji)}
-                          className="flex h-11 w-11 items-center justify-center rounded-full bg-white/10 text-xl transition-transform hover:scale-110 active:scale-95"
+                          className={`pressable-btn relative flex h-11 w-11 items-center justify-center rounded-full bg-white/10 text-xl transition-transform hover:scale-110 active:scale-95 ${lastReactionClicked === emoji ? 'scale-90 bg-fuchsia-500/30' : ''}`}
                           aria-label={`Send reaction ${emoji}`}
                         >
                           {emoji}
+                          {isReactionSending && lastReactionClicked === emoji && (
+                            <Loader2 className="absolute -right-1 -top-1 h-3.5 w-3.5 animate-spin text-fuchsia-200" />
+                          )}
                         </button>
                       ))}
                     </div>
@@ -1023,13 +1207,14 @@ export default function App() {
                       onClick={() => submitGuess(p.id)}
                       disabled={myGuessSubmitted}
                       className={`min-h-14 rounded-2xl border px-4 py-4 text-sm font-bold transition-all ${
-                        gameState.guesses[myId || ''] === p.id
+                        (optimisticGuessId || gameState.guesses[myId || '']) === p.id
                           ? 'bg-gradient-to-r from-fuchsia-500 to-orange-400 border-fuchsia-300 text-white shadow-lg shadow-fuchsia-900/20'
                           : 'bg-white/6 border-white/10 hover:border-fuchsia-300/40 text-zinc-200'
                       } disabled:opacity-50`}
                     >
                       <span className="inline-flex items-center gap-2">
                         {displayName(p.name)}
+                        {isGuessSending && optimisticGuessId === p.id && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
                         {!gameState.guesses[p.id] ? (
                           <span className="h-2 w-2 rounded-full bg-amber-300 animate-pulse" aria-label="Waiting for vote" />
                         ) : (
@@ -1068,7 +1253,7 @@ export default function App() {
                 key="results"
                 initial={{ opacity: 0, scale: 0.9 }}
                 animate={{ opacity: 1, scale: 1 }}
-                className="flex flex-col gap-6"
+                className="ui-stage flex flex-col gap-6"
               >
                 <div className="space-y-2 text-center">
                   <h2 className="text-xs font-black uppercase tracking-widest text-cyan-200 sm:text-sm">The Owner Was</h2>
@@ -1129,7 +1314,7 @@ export default function App() {
                 key="gameover"
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
-                className="mt-6 flex flex-col items-center gap-8 text-center"
+                className="ui-stage mt-6 flex flex-col items-center gap-8 text-center"
               >
                 <div className="space-y-2">
                   <Trophy className="mx-auto mb-4 h-16 w-16 text-amber-300" />
@@ -1175,11 +1360,20 @@ export default function App() {
             </div>
             <button
               onClick={startGame}
-              disabled={players.length < 2}
-              className="flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-fuchsia-500 via-pink-500 to-orange-400 py-4 font-black text-white shadow-xl shadow-fuchsia-900/30 transition-all hover:scale-[1.01] hover:from-fuchsia-400 hover:to-orange-300 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:scale-100"
+              disabled={players.length < 2 || startLocked}
+              className={`pressable-btn flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-fuchsia-500 via-pink-500 to-orange-400 py-4 font-black text-white shadow-xl shadow-fuchsia-900/30 transition-all hover:scale-[1.01] hover:from-fuchsia-400 hover:to-orange-300 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:scale-100 ${startStatus === 'clicked' ? 'scale-[0.99]' : ''}`}
             >
-              <Play className="w-5 h-5 fill-current" />
-              Start Game
+              {startStatus === 'sending' ? (
+                <>
+                  <Loader2 className="w-5 h-5 animate-spin" />
+                  Sending...
+                </>
+              ) : (
+                <>
+                  <Play className="w-5 h-5 fill-current" />
+                  Start Game
+                </>
+              )}
             </button>
           </div>
         </div>
@@ -1254,6 +1448,24 @@ export default function App() {
             </div>
           </motion.aside>
         </>
+      )}
+
+      {processingOverlay.active && (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/60 px-4 backdrop-blur-sm transition-opacity duration-200">
+          <div className="w-full max-w-sm rounded-3xl border border-white/10 bg-zinc-950/90 p-5 shadow-2xl shadow-black/40">
+            <div className="mb-3 flex items-center gap-2 text-fuchsia-200">
+              <Loader2 className="h-5 w-5 animate-spin" />
+              <p className="text-sm font-bold uppercase tracking-widest">{processingOverlay.status}</p>
+            </div>
+            <div className="h-2 overflow-hidden rounded-full bg-white/10">
+              <div
+                className="h-full rounded-full bg-gradient-to-r from-fuchsia-500 via-pink-400 to-cyan-300 transition-[width] duration-200"
+                style={{ width: `${processingOverlay.progress}%` }}
+              />
+            </div>
+            <p className="mt-2 text-right text-xs font-semibold text-zinc-300">{processingOverlay.progress}%</p>
+          </div>
+        </div>
       )}
     </div>
   );
