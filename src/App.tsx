@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { motion, AnimatePresence } from 'motion/react';
-import { Camera, Users, Trophy, Play, Clock, CheckCircle2, XCircle, Loader2, MessageCircle, Send, X } from 'lucide-react';
+import { Camera, Users, Trophy, Play, Clock, CheckCircle2, XCircle, Loader2, MessageCircle, Send, X, Shuffle } from 'lucide-react';
 
 const sharedClientToken = (() => {
   if (typeof window === 'undefined') return 'server';
@@ -17,11 +17,7 @@ const sharedSocket = (() => {
   if (typeof window === 'undefined') return null;
 
   const configuredSocketUrl = (import.meta.env.VITE_SOCKET_URL as string | undefined)?.trim();
-  const socketUrl = configuredSocketUrl
-    ? configuredSocketUrl
-    : import.meta.env.DEV && window.location.port !== '3000'
-      ? `${window.location.protocol}//${window.location.hostname}:3000`
-      : undefined;
+  const socketUrl = configuredSocketUrl || window.location.origin;
 
   const w = window as Window & { __photoRouletteSocket?: Socket };
   if (!w.__photoRouletteSocket) {
@@ -87,6 +83,18 @@ interface CelebrationPopup {
   tone: string;
 }
 
+interface ReviewPhotoItem {
+  id: string;
+  file: File;
+  previewUrl: string;
+  loaded: boolean;
+}
+
+interface PhotoReviewState {
+  selected: ReviewPhotoItem[];
+  pool: ReviewPhotoItem[];
+}
+
 const celebrationPhrases = ['WOW', 'SZTOS', 'YASSS', '<3', 'OMG', 'LETS GO', 'ICONIC', 'MEGA'];
 const celebrationTones = [
   'from-fuchsia-400 via-pink-400 to-orange-300 text-white shadow-fuchsia-500/30',
@@ -111,6 +119,31 @@ function sampleRandomItems<T>(items: T[], count: number): T[] {
     [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
   }
   return shuffled.slice(0, count);
+}
+
+function createReviewPhotoId(file: File): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID();
+  }
+
+  return `${file.name}-${file.size}-${file.lastModified}-${Math.random().toString(36).slice(2)}`;
+}
+
+function createReviewPhotoItem(file: File): ReviewPhotoItem {
+  return {
+    id: createReviewPhotoId(file),
+    file,
+    previewUrl: URL.createObjectURL(file),
+    loaded: false,
+  };
+}
+
+function releaseReviewSelection(selection: PhotoReviewState | null) {
+  if (!selection) return;
+
+  for (const item of [...selection.selected, ...selection.pool]) {
+    URL.revokeObjectURL(item.previewUrl);
+  }
 }
 
 async function mapWithConcurrency<T, R>(
@@ -149,11 +182,13 @@ export default function App() {
   const [floatingReactions, setFloatingReactions] = useState<ReactionEvent[]>([]);
   const [celebrationPopups, setCelebrationPopups] = useState<CelebrationPopup[]>([]);
   const [animatedScores, setAnimatedScores] = useState<Record<string, number>>({});
+  const [photoReview, setPhotoReview] = useState<PhotoReviewState | null>(null);
   const lastCelebrationKeyRef = useRef<string>('');
   const celebrationTimeoutRef = useRef<number | null>(null);
   const scoreAnimationRef = useRef<number | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const lastReactionSentAtRef = useRef(0);
+  const photoReviewRef = useRef<PhotoReviewState | null>(null);
 
   useEffect(() => {
     const savedMessages = window.localStorage.getItem('photo-roulette-chat');
@@ -169,6 +204,10 @@ export default function App() {
   useEffect(() => {
     window.localStorage.setItem('photo-roulette-chat', JSON.stringify(chatMessages.slice(-50)));
   }, [chatMessages]);
+
+  useEffect(() => {
+    photoReviewRef.current = photoReview;
+  }, [photoReview]);
 
   useEffect(() => {
     if (!chatOpen) return;
@@ -264,6 +303,12 @@ export default function App() {
     if (gameState.status !== 'UPLOADING' || myPlayer?.photosUploaded) {
       setIsUploading(false);
       setUploadProgress(0);
+
+      if (myPlayer?.photosUploaded) {
+        releaseReviewSelection(photoReviewRef.current);
+        photoReviewRef.current = null;
+        setPhotoReview(null);
+      }
     }
   }, [gameState, isUploading, socket?.id]);
 
@@ -333,6 +378,7 @@ export default function App() {
       if (scoreAnimationRef.current) {
         window.cancelAnimationFrame(scoreAnimationRef.current);
       }
+      releaseReviewSelection(photoReviewRef.current);
     };
   }, []);
 
@@ -411,10 +457,74 @@ export default function App() {
     socket.emit('photoReaction', emoji);
   };
 
-  const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []) as File[];
+  const openPhotoReview = (files: File[]) => {
     if (files.length < 10) {
       alert('Please select at least 10 photos for the roulette!');
+      return;
+    }
+
+    releaseReviewSelection(photoReviewRef.current);
+
+    const pickedFiles = sampleRandomItems(files, 10);
+    const pickedSet = new Set(pickedFiles);
+    const poolFiles = files.filter((file) => !pickedSet.has(file));
+
+    setUploadProgress(0);
+    setIsUploading(false);
+    setPhotoReview({
+      selected: pickedFiles.map(createReviewPhotoItem),
+      pool: sampleRandomItems(poolFiles, poolFiles.length).map(createReviewPhotoItem),
+    });
+  };
+
+  const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []) as File[];
+    openPhotoReview(files);
+    e.target.value = '';
+  };
+
+  const markReviewPhotoLoaded = (photoId: string) => {
+    setPhotoReview((current) => {
+      if (!current) return current;
+
+      return {
+        ...current,
+        selected: current.selected.map((item) => (item.id === photoId ? { ...item, loaded: true } : item)),
+        pool: current.pool.map((item) => (item.id === photoId ? { ...item, loaded: true } : item)),
+      };
+    });
+  };
+
+  const swapReviewPhoto = (photoId: string) => {
+    setPhotoReview((current) => {
+      if (!current || current.pool.length === 0) return current;
+
+      const selectedIndex = current.selected.findIndex((item) => item.id === photoId);
+      if (selectedIndex === -1) return current;
+
+      const poolIndex = Math.floor(Math.random() * current.pool.length);
+      const replacement = current.pool[poolIndex];
+      const replacedPhoto = current.selected[selectedIndex];
+
+      const nextSelected = [...current.selected];
+      nextSelected[selectedIndex] = replacement;
+
+      const nextPool = [...current.pool];
+      nextPool.splice(poolIndex, 1, replacedPhoto);
+
+      return {
+        ...current,
+        selected: nextSelected,
+        pool: nextPool,
+      };
+    });
+  };
+
+  const confirmPhotoReview = async () => {
+    if (!photoReview || photoReview.selected.length < 10 || isUploading) return;
+
+    if (!socket) {
+      alert('Unable to connect to the server. Please try again.');
       return;
     }
 
@@ -422,7 +532,7 @@ export default function App() {
     setUploadProgress(0);
 
     try {
-      const selectedFiles = sampleRandomItems(files, 10);
+      const selectedFiles: File[] = photoReview.selected.map((item) => item.file);
       let completed = 0;
       const processedPhotos = await mapWithConcurrency(selectedFiles, 3, async (file) => {
         const resized = await resizeAndCompressImage(file);
@@ -432,14 +542,12 @@ export default function App() {
       });
 
       setUploadProgress(100);
-      socket?.emit('uploadPhotos', processedPhotos);
+      socket.emit('uploadPhotos', processedPhotos);
     } catch (error) {
       console.error('Photo processing failed:', error);
       alert('Unable to process photos. Please try again.');
       setIsUploading(false);
       setUploadProgress(0);
-    } finally {
-      e.target.value = '';
     }
   };
 
@@ -508,6 +616,9 @@ export default function App() {
   const myGuessSubmitted = !!gameState.guesses[myId || ''];
   const me = myId ? gameState.players[myId] : null;
   const isHost = !!me?.isHost || gameState.hostId === myId;
+  const reviewSelectedCount = photoReview?.selected.length ?? 0;
+  const reviewPoolCount = photoReview?.pool.length ?? 0;
+  const canSwapPhoto = reviewPoolCount > 0;
 
   return (
     <div className="relative min-h-dvh overflow-x-hidden bg-[#09090f] text-zinc-100 font-sans selection:bg-fuchsia-500/30 selection:text-white">
@@ -675,39 +786,133 @@ export default function App() {
                       <h2 className="text-3xl font-black sm:text-4xl bg-gradient-to-r from-fuchsia-300 via-pink-200 to-cyan-200 bg-clip-text text-transparent">Photo Roulette!</h2>
                       <p className="text-sm text-zinc-300 sm:text-base">Select a batch of photos. We'll randomly pick 10 for the game.</p>
                     </div>
-                    
-                    <label className="group flex w-full aspect-square max-w-[min(280px,80vw)] cursor-pointer flex-col items-center justify-center gap-4 rounded-[2rem] border-2 border-dashed border-fuchsia-300/30 bg-gradient-to-br from-white/8 via-fuchsia-500/10 to-cyan-500/10 transition-all hover:scale-[1.01] hover:border-fuchsia-300/60">
-                      <input
-                        type="file"
-                        multiple
-                        accept="image/*"
-                        onChange={handlePhotoUpload}
-                        className="hidden"
-                        disabled={isUploading}
-                      />
-                      {isUploading ? (
-                        <div className="flex w-full max-w-[220px] flex-col items-center gap-4 px-4">
-                          <div className="flex items-center gap-2 text-fuchsia-200">
-                            <Loader2 className="h-5 w-5 animate-spin" />
-                            <p className="text-sm font-semibold">Uploading &amp; Processing...</p>
-                          </div>
-                          <div className="h-2 w-full overflow-hidden rounded-full bg-white/15">
-                            <div
-                              className="h-full rounded-full bg-gradient-to-r from-fuchsia-500 via-pink-400 to-cyan-300 transition-[width] duration-300"
-                              style={{ width: `${uploadProgress}%` }}
-                            />
-                          </div>
-                          <span className="text-xs font-bold tracking-wide text-zinc-300">{uploadProgress}%</span>
+
+                    {!photoReview ? (
+                      <label className="group flex w-full aspect-square max-w-[min(280px,80vw)] cursor-pointer flex-col items-center justify-center gap-4 rounded-[2rem] border-2 border-dashed border-fuchsia-300/30 bg-gradient-to-br from-white/8 via-fuchsia-500/10 to-cyan-500/10 transition-all hover:scale-[1.01] hover:border-fuchsia-300/60">
+                        <input
+                          type="file"
+                          multiple
+                          accept="image/*"
+                          onChange={handlePhotoUpload}
+                          className="hidden"
+                          disabled={isUploading}
+                        />
+                        <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-fuchsia-500 via-pink-500 to-orange-400 shadow-lg shadow-fuchsia-900/30 transition-transform group-hover:scale-110">
+                          <Camera className="h-8 w-8 text-white" />
                         </div>
-                      ) : (
-                        <>
-                          <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-fuchsia-500 via-pink-500 to-orange-400 shadow-lg shadow-fuchsia-900/30 transition-transform group-hover:scale-110">
-                            <Camera className="h-8 w-8 text-white" />
+                        <span className="font-bold text-lg">Access Gallery</span>
+                      </label>
+                    ) : (
+                      <div className="w-full space-y-4 text-left">
+                        <div className="rounded-[1.75rem] border border-white/10 bg-white/5 p-4 shadow-2xl shadow-black/20 backdrop-blur-xl">
+                          <div className="mb-4 flex items-start justify-between gap-4">
+                            <div>
+                              <h3 className="text-xl font-black text-white">Review &amp; Swap</h3>
+                              <p className="mt-1 text-sm text-zinc-300">Ten random photos are ready. Swap any of them before the upload.</p>
+                            </div>
+                            <div className="rounded-2xl border border-cyan-400/20 bg-cyan-400/10 px-3 py-2 text-right">
+                              <p className="text-[10px] font-black uppercase tracking-[0.24em] text-cyan-200">Selected</p>
+                              <p className="text-lg font-black text-white">{reviewSelectedCount}/10</p>
+                            </div>
                           </div>
-                          <span className="font-bold text-lg">Access Gallery</span>
-                        </>
-                      )}
-                    </label>
+
+                          <div className="max-h-[min(58dvh,540px)] overflow-y-auto rounded-[1.5rem] border border-white/10 bg-zinc-950/30 p-3">
+                            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+                              {photoReview.selected.map((photo, index) => (
+                                <div key={photo.id} className="group relative overflow-hidden rounded-[1.35rem] border border-white/10 bg-zinc-900 shadow-lg shadow-black/20">
+                                  <div className="relative aspect-square">
+                                    <img
+                                      src={photo.previewUrl}
+                                      alt={`Selected photo ${index + 1}`}
+                                      onLoad={() => markReviewPhotoLoaded(photo.id)}
+                                      onError={() => markReviewPhotoLoaded(photo.id)}
+                                      className={`h-full w-full object-cover transition-all duration-300 ${photo.loaded ? 'scale-100 opacity-100' : 'scale-[1.02] opacity-0'}`}
+                                    />
+                                    {!photo.loaded && (
+                                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-gradient-to-br from-white/10 via-white/5 to-cyan-400/10 text-zinc-200">
+                                        <Loader2 className="h-5 w-5 animate-spin text-fuchsia-300" />
+                                        <span className="text-xs font-semibold uppercase tracking-[0.25em] text-zinc-300">Loading...</span>
+                                      </div>
+                                    )}
+                                    <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(180deg,transparent_0%,transparent_65%,rgba(0,0,0,0.58)_100%)]" />
+                                    <div className="absolute left-2 top-2 rounded-full border border-white/15 bg-black/35 px-2 py-1 text-[10px] font-black uppercase tracking-[0.24em] text-white backdrop-blur-md">
+                                      #{index + 1}
+                                    </div>
+                                    <button
+                                      type="button"
+                                      onClick={() => swapReviewPhoto(photo.id)}
+                                      disabled={!canSwapPhoto || isUploading}
+                                      className="absolute right-2 top-2 inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-black/50 px-3 py-1.5 text-[11px] font-black uppercase tracking-[0.2em] text-white shadow-lg shadow-black/20 backdrop-blur-md transition-transform hover:scale-[1.03] disabled:cursor-not-allowed disabled:opacity-40"
+                                    >
+                                      <Shuffle className="h-3.5 w-3.5" />
+                                      Swap
+                                    </button>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+
+                          <div className="mt-4 space-y-3">
+                            {!canSwapPhoto ? (
+                              <div className="rounded-2xl border border-amber-300/20 bg-amber-300/10 px-4 py-3 text-sm font-medium text-amber-100">
+                                Wybierz więcej zdjęć z galerii, aby mieć na co wymienić!
+                              </div>
+                            ) : (
+                              <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-zinc-300">
+                                You have {reviewPoolCount} spare photo{reviewPoolCount === 1 ? '' : 's'} in the pool.
+                              </div>
+                            )}
+
+                            <div className="grid gap-3 sm:grid-cols-2">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  releaseReviewSelection(photoReviewRef.current);
+                                  photoReviewRef.current = null;
+                                  setPhotoReview(null);
+                                  setUploadProgress(0);
+                                }}
+                                disabled={isUploading}
+                                className="rounded-3xl border border-white/10 bg-white/5 py-4 font-black text-zinc-200 transition-all hover:border-white/20 hover:bg-white/8 disabled:cursor-not-allowed disabled:opacity-40"
+                              >
+                                Choose Different Photos
+                              </button>
+                              <button
+                                type="button"
+                                onClick={confirmPhotoReview}
+                                disabled={isUploading}
+                                className="flex items-center justify-center gap-2 rounded-3xl bg-gradient-to-r from-fuchsia-500 via-pink-500 to-orange-400 py-4 font-black text-white shadow-xl shadow-fuchsia-900/30 transition-all hover:scale-[1.01] hover:from-fuchsia-400 hover:to-orange-300 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:scale-100"
+                              >
+                                {isUploading ? (
+                                  <>
+                                    <Loader2 className="h-5 w-5 animate-spin" />
+                                    Preparing Upload... {uploadProgress}%
+                                  </>
+                                ) : (
+                                  'Zatwierdź i Graj'
+                                )}
+                              </button>
+                            </div>
+
+                            {isUploading && (
+                              <div className="space-y-2 rounded-2xl border border-fuchsia-400/20 bg-fuchsia-400/10 px-4 py-3 text-sm text-fuchsia-100">
+                                <div className="flex items-center gap-2 font-semibold">
+                                  <Loader2 className="h-4 w-4 animate-spin" />
+                                  <span>Compressing and sending photos...</span>
+                                </div>
+                                <div className="h-2 overflow-hidden rounded-full bg-white/10">
+                                  <div
+                                    className="h-full rounded-full bg-gradient-to-r from-fuchsia-500 via-pink-400 to-cyan-300 transition-[width] duration-300"
+                                    style={{ width: `${uploadProgress}%` }}
+                                  />
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
                   </>
                 ) : (
                   <div className="space-y-6">
