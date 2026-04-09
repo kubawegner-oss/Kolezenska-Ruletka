@@ -1,0 +1,5 @@
+{
+  "name": "Photo Roulette Clone",
+  "description": "A fast-paced multiplayer game where players guess whose photo is being shown from a random pool.",
+  "requestFramePermissions": []
+}
